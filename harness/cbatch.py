@@ -22,7 +22,7 @@ from fast_north import FastNorth
 
 
 class Request:
-    __slots__ = ("rid", "ids", "max_new", "arrival", "slot", "pos", "cur", "out", "t_admit", "t_first", "t_done", "prefill_s")
+    __slots__ = ("rid", "ids", "max_new", "arrival", "slot", "pos", "cur", "out", "t_admit", "t_first", "t_done", "prefill_s", "pf")
 
     def __init__(self, rid, ids, max_new, arrival=0.0):
         self.rid, self.ids, self.max_new, self.arrival = rid, list(ids), max_new, arrival
@@ -31,7 +31,8 @@ class Request:
 
 
 class ContinuousEngine:
-    def __init__(self, model, Lmax, slots=32, buckets=(1, 2, 4, 8, 16, 32), prefill="batched_inv", prefill_tokens=8192):
+    def __init__(self, model, Lmax, slots=32, buckets=(1, 2, 4, 8, 16, 32), prefill="batched_inv", prefill_tokens=8192,
+                 chunk=0, chunk_budget=2048):
         """prefill: 'single' = one chunked-SDPA forward per request (LCNorth; a request's KV never depends on other requests);
         'graph' = one request at a time like 'single', but through a CUDA graph per padded length bucket (128..pow2 >= Lmax) that
         prefills into a staging KV, then copies the request's positions into its slot: no per-request launch overhead, and the padding
@@ -42,6 +43,10 @@ class ContinuousEngine:
         'batched' = every request admitted in an iteration is prefilled in ONE forward (concatenated tokens, block-diagonal causal mask,
         up to prefill_tokens per forward): far fewer launches and one expert-weight pass, but the batched expert GEMM may round a
         request's activations differently depending on its co-prefilled requests (measured in bench_cbatch.py)."""
+        # chunk > 0 (H29): chunked prefill interleaved with decode. Each prompt is cut at FIXED positions 0, chunk, 2*chunk, ... (the cut
+        # depends only on the request); each iteration runs whole chunks from prefilling requests (FIFO) up to chunk_budget tokens in one
+        # forward (GEMMs batched, attention per chunk over that request's cached keys), then one decode step for the decoding requests.
+        self.chunk, self.chunk_budget = chunk, chunk_budget
         assert max(buckets) >= slots and prefill in ("single", "batched", "graph", "batched_inv")
         self.Lmax, self.slots, self.prefill_mode, self.prefill_tokens = Lmax, slots, prefill, prefill_tokens
         self.buckets = tuple(b for b in buckets if b <= slots) or (slots,)
@@ -245,6 +250,80 @@ class ContinuousEngine:
                 m = mlp.experts(hf, ix_, sc_).reshape(1, N, -1)
             x = x + a + m
 
+    def _chunk_mask(self, a, b):
+        if not hasattr(self, "_cmasks"):
+            self._cmasks = {}
+        if (a, b) not in self._cmasks:
+            cfg = self.ref.model.config
+            G, W = cfg.num_attention_heads // cfg.num_key_value_heads, cfg.sliding_window
+            t = torch.arange(a, b, device=self.ref.device)
+            j = torch.arange(b, device=self.ref.device)
+            mf = j[None, :] <= t[:, None]
+            self._cmasks[(a, b)] = (mf.repeat(G, 1), (mf & (t[:, None] - j[None, :] < W)).repeat(G, 1))
+        return self._cmasks[(a, b)]
+
+    @torch.no_grad()
+    def _prefill_chunks(self, chunks):
+        """chunks: [(request, a, b)] = prompt positions [a, b) of each request. GEMMs over all chunk tokens at once; per layer every chunk's
+        K/V is written to its slot before attention, so a later chunk of the same request in the same forward sees it. Each chunk's
+        attention is the same call whether or not other requests share the forward."""
+        import torch.nn.functional as F
+        from transformers.models.cohere2_moe.modeling_cohere2_moe import apply_rotary_pos_emb
+        mdl, cfg, dev = self.ref.model, self.ref.model.config, self.ref.device
+        D, H, Hkv = cfg.head_dim, cfg.num_attention_heads, cfg.num_key_value_heads
+        G = H // Hkv
+        toks = [t for r, a, b in chunks for t in r.ids[a:b]]
+        N = len(toks)
+        ids = torch.tensor([toks], device=dev)
+        pos = torch.cat([torch.arange(a, b, device=dev) for _, a, b in chunks])
+        offs = [0]
+        for _, a, b in chunks:
+            offs.append(offs[-1] + b - a)
+        x = mdl.embed_tokens(ids)
+        cos, sin = mdl.rotary_emb(x, pos[None])
+        for i, layer in enumerate(mdl.layers):
+            h = layer.input_layernorm(x)
+            at = layer.self_attn
+            sliding = cfg.layer_types[i] == "sliding_attention"
+            q = at.q_proj(h).view(1, N, H, D).transpose(1, 2)
+            k = at.k_proj(h).view(1, N, Hkv, D).transpose(1, 2)
+            v = at.v_proj(h).view(1, N, Hkv, D).transpose(1, 2)
+            if sliding or at.force_rope:
+                q, k = apply_rotary_pos_emb(q, k, cos, sin)
+            for (r, a, b), o0 in zip(chunks, offs):
+                kc, vc = self.kvs[r.slot][i]
+                kc[:, :, a:b].copy_(k[:, :, o0:o0 + b - a]); vc[:, :, a:b].copy_(v[:, :, o0:o0 + b - a])
+            outs = []
+            for (r, a, b), o0 in zip(chunks, offs):
+                n = b - a
+                kc, vc = self.kvs[r.slot][i]
+                mf_, ms_ = self._chunk_mask(a, b)
+                qs = q[:, :, o0:o0 + n].reshape(1, Hkv, G * n, D)
+                os_ = F.scaled_dot_product_attention(qs, kc[:, :, :b], vc[:, :, :b], attn_mask=ms_ if sliding else mf_)
+                outs.append(os_.reshape(1, Hkv, G, n, D).reshape(1, H, n, D).transpose(1, 2).reshape(1, n, H * D))
+            a_ = at.o_proj(torch.cat(outs, 1))
+            mlp = layer.mlp
+            if not hasattr(mlp, "gate"):
+                m = mlp(h)
+            else:
+                hf = h.reshape(-1, h.shape[-1])
+                _, sc_, ix_ = mlp.gate(hf)
+                m = mlp.experts(hf, ix_, sc_).reshape(1, N, -1)
+            x = x + a_ + m
+
+    def _plan_chunks(self, pre):
+        """Whole fixed-position chunks from prefilling requests, FIFO, up to chunk_budget tokens (always at least one chunk)."""
+        out, used = [], 0
+        for r in pre:
+            L = len(r.ids) - 1
+            p = r.pf
+            while p < L:
+                b = min(L, (p // self.chunk + 1) * self.chunk)
+                if out and used + (b - p) > self.chunk_budget:
+                    return out
+                out.append((r, p, b)); used += b - p; p = b
+        return out
+
     @torch.no_grad()
     def _step(self, act):
         n = len(act)
@@ -263,17 +342,36 @@ class ContinuousEngine:
             assert len(r.ids) + r.max_new + 16 < self.Lmax, (r.rid, len(r.ids))
         pend = sorted(requests, key=lambda r: r.arrival)
         free = list(range(self.slots))
-        act = []
+        act, pre = [], []
         steps, rows, bsum = 0, 0, 0
         t0 = clock()
-        while pend or act:
+        while pend or act or pre:
             now = clock() - t0
             new = []
             while pend and pend[0].arrival <= now and free:
                 r = pend.pop(0); r.slot = free.pop(0); r.t_admit = clock() - t0; new.append(r)
-            if new:
+            if new and not self.chunk:
                 self._prefill(new); act.extend(new)
+            elif new:
+                for r in new:
+                    r.pf = 0
+                pre.extend(new)
+            if pre:
+                ch = self._plan_chunks(pre)
+                tpf = time.perf_counter()
+                self._prefill_chunks(ch)
+                dpf = time.perf_counter() - tpf
+                ntok = sum(b_ - a_ for _, a_, b_ in ch)
+                for r, a, b in ch:
+                    r.pf = b; r.prefill_s += dpf * (b - a) / ntok
+                done_pf = [r for r in pre if r.pf >= len(r.ids) - 1]
+                for r in done_pf:
+                    r.pos, r.cur = len(r.ids) - 1, r.ids[-1]
+                pre = [r for r in pre if r.pf < len(r.ids) - 1]
+                act.extend(done_pf)
             if not act:
+                if pre:
+                    continue
                 if pend:
                     time.sleep(max(0.0, min(0.002, pend[0].arrival - (clock() - t0))))
                 continue

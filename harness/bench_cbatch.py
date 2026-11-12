@@ -54,7 +54,12 @@ def main():
     f = out.open("a")
     add = lambda **r: (f.write(json.dumps(r) + "\n"), f.flush())
     t0 = time.time()
-    eng = ContinuousEngine(m, max(len(p) for p in prompts) + MAX_NEW + 40, slots=32, prefill=PREFILL)
+    if PREFILL.startswith("chunked"):   # chunked512 / chunked512b4096: batched_inv math, fixed chunk size, per-iteration token budget
+        spec = PREFILL[7:].split("b")
+        ck = dict(chunk=int(spec[0]), chunk_budget=int(spec[1]) if len(spec) > 1 else 2048)
+        eng = ContinuousEngine(m, max(len(p) for p in prompts) + MAX_NEW + 40, slots=32, prefill="batched_inv", **ck)
+    else:
+        eng = ContinuousEngine(m, max(len(p) for p in prompts) + MAX_NEW + 40, slots=32, prefill=PREFILL)
     add(phase="meta", prefill=PREFILL, torch=torch.__version__, pool=[p[0] for p in pool], buckets=eng.buckets, init_s=time.time() - t0)
     scheds = {r: schedule(n_req, r, 20261112, len(prompts)) for r in rates}
     schedf.write_text(json.dumps(dict(max_new=MAX_NEW, pool=[p[0] for p in pool], scheds=scheds)))
